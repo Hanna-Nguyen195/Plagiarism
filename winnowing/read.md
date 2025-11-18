@@ -5,7 +5,7 @@ Công cụ kiểm tra đạo văn sử dụng thuật toán Winnowing.
 📌 Cách chạy chương trình
 
 Chạy lệnh sau trong terminal hoặc cmd:
-
+`python D:\Code\Python\Project_Python\DNU_PlagiarismChecker\winnowing\database.py` : connect to PostgresSQL
 `python D:\Code\Python\Project_Python\DNU_PlagiarismChecker\Plagiarism\winnowing\main.py`
 
 📌 Luồng hoạt động chính
