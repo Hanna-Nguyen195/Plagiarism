@@ -89,124 +89,161 @@ class WinnowingPlagiarismDetector:
         merged.append((current_text, s1, e1, s2, e2))
         return merged
 
-    def calculate_similarity(
-        self, original_text1: str, original_text2: str, processed_text1: str, processed_text2: str, matches: List[Tuple[str, int, int, int, int]]
-    ) -> Dict:
-        len1, len2 = len(processed_text1), len(processed_text2)
-        orig_len1, orig_len2 = len(original_text1), len(original_text2)
-        if len1 < self.k or len2 < self.k:
-            return {
-                "similarity": 0.0,
-                "matches": [],
-                "matched_chars": 0,
-                "text1_length": orig_len1,
-                "text2_length": orig_len2,
-            }
+    def get_bbox_from_char_range(self, pdf_path: str, segments: List[Tuple[str, int, int]]) -> List[dict]:
+        """
+        Dùng char index (start, end) để lấy bbox chính xác từ page.chars
+        → Đây là cách CHUẨN NHẤT, KHÔNG BAO GIỜ MISS
+        """
+        results = []
 
-        # marched_chars là tổng số ký tự trùng khớp trong các đoạn đã mở rộng
-        # original lengths là độ dài ban đầu của văn bản
-        # processed lengths là độ dài của văn bản đã được xử lý
-        matched_chars = sum(end1 - start1 for _, start1, end1, _, _ in matches)
-        similarity = (matched_chars / orig_len1) * 100 if orig_len1 > 0 else 0.0
-        logging.info(
-            f"Matched chars: {matched_chars}, Original Text1 length: {orig_len1}, Original Text2 length: {orig_len2}, Similarity: {similarity:.2f}%"
-        )
+        with pdfplumber.open(pdf_path) as pdf:
+            # Tạo offset cho từng trang
+            page_offsets = []
+            offset = 0
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                page_offsets.append((i + 1, page, offset, offset + len(text)))
+                offset += len(text) + 1
 
-        return {
-            "similarity": similarity,
-            "matches": matches,
-            "matched_chars": matched_chars,
-            "text1_length": orig_len1,
-            "text2_length": orig_len2,
-        }
+            for text, start_char, end_char in segments:
+                if end_char <= start_char or len(text) < 30:
+                    continue
 
-    def detect_plagiarism_overall(self, query_path: str) -> Dict:
+                for page_num, page, p_start, p_end in page_offsets:
+                    if start_char >= p_end or end_char <= p_start:
+                        continue
+
+                    local_start = max(start_char - p_start, 0)
+                    local_end = min(end_char - p_start, len(page.extract_text() or ""))
+
+                    chars = page.chars
+                    if not chars:
+                        continue
+
+                    matched = []
+                    for ch in chars:
+                        if "text" not in ch or not ch["text"]:
+                            continue
+                        # Ước lượng vị trí ký tự
+                        try:
+                            pos = (page.extract_text() or "").find(ch["text"], local_start)
+                            if pos != -1 and pos < local_end:
+                                matched.append(ch)
+                        except:
+                            continue
+
+                    if not matched:
+                        continue
+
+                    xs = [ch["x0"] for ch in matched] + [ch["x1"] for ch in matched]
+                    ys_top = [ch["top"] for ch in matched]
+                    ys_bottom = [ch["bottom"] for ch in matched]
+
+                    x0, x1 = min(xs), max(xs)
+                    y0 = page.height - max(ys_top)      # top-left
+                    y1 = page.height - min(ys_bottom)
+
+                    results.append({
+                        "pageNumber": page_num,
+                        "similarity_content": [{
+                            "content": text.strip(),
+                            "rects": [[round(x0,2), round(y0,2), round(x1,2), round(y1,2)]]
+                        }]
+                    })
+        return results
+
+    def detect_plagiarism_overall(self, query_path: str, min_similarity: float = 0.05) -> Dict:
+        """
+        Hàm chính - trả về JSON đúng chuẩn frontend
+        min_similarity=0.05 → hiện tài liệu từ 5% trở lên
+        """
         session: SASession = SessionLocal()
         try:
             query_text = self.extract_text_from_pdf(query_path)
             if not query_text:
-                return {"error": "Không thể trích xuất nội dung từ file PDF"}
+                return {"error": "Không thể đọc file PDF"}
+
+            with pdfplumber.open(query_path) as pdf:
+                if not pdf.pages:
+                    return {"error": "PDF rỗng"}
+                page_width = round(pdf.pages[0].width, 2)
+                page_height = round(pdf.pages[0].height, 2)
 
             processed_query = self.winnowing.preprocess_text(query_text)
             fps_query = self.winnowing.generate_fingerprints(query_text)
 
-            # Tìm tất cả hash trùng trong database
-            all_matches = []
+            # Tìm matches trong DB
+            matches_by_pdf = defaultdict(list)
             for h, pos_q in fps_query:
-                db_matches = session.query(Fingerprint.pdf_id, Fingerprint.position).filter(Fingerprint.hash_value == str(h)).all()
+                results = session.query(Fingerprint.pdf_id, Fingerprint.position, PDFFile.filename, PDFFile.full_content)\
+                    .join(PDFFile).filter(Fingerprint.hash_value == h).all()
+                for pdf_id, pos_d, filename, content in results:
+                    matches_by_pdf[pdf_id].append((h, pos_q, pos_d))
 
-                for pdf_id, pos_d in db_matches:
-                    all_matches.append((h, pos_q, pos_d, pdf_id))
-
-            if not all_matches:
+            if not matches_by_pdf:
                 return {
-                    "overall_similarity": 0.0,
-                    "total_matched_chars": 0,
-                    "text_length": len(query_text),
-                    "matches": [],
+                    "data": {
+                        "total_percent": 0.0,
+                        "size_page": {"width": page_width, "height": page_height},
+                        "similarity_documents": []
+                    }
                 }
 
-            # Gom match theo từng pdf để mở rộng đoạn
-            matches_by_pdf = defaultdict(list)
-            for h, pos_q, pos_d, pdf_id in all_matches:
-                matches_by_pdf[pdf_id].append((h, pos_q, pos_d))
+            similarity_documents = []
+            total_matched_tokens = 0
+            query_tokens = len(query_text.split())
 
-            merged_matches = []
+            # Duyệt từng tài liệu nguồn
             for pdf_id, matches in matches_by_pdf.items():
                 doc = session.get(PDFFile, pdf_id)
                 if not doc:
                     continue
+
                 processed_doc = self.winnowing.preprocess_text(doc.full_content)
                 expanded = self.merge_and_expand_matches(
                     query_text, doc.full_content, processed_query, processed_doc, matches
                 )
-                for text, s1, e1, s2, e2 in expanded:
-                    merged_matches.append({
-                        "text": text,
-                        "start": s1,
-                        "end": e1,
-                        "pdf_id": pdf_id,
-                        "filename": doc.filename
-                    })
 
-            # Gộp các vùng trùng lặp trên văn bản query để tránh đếm 2 lần
-            merged_intervals = []
-            for m in sorted(merged_matches, key=lambda x: x["start"]):
-                if not merged_intervals or m["start"] > merged_intervals[-1][1]:
-                    merged_intervals.append([m["start"], m["end"]])
-                else:
-                    merged_intervals[-1][1] = max(merged_intervals[-1][1], m["end"])
+                # Chỉ lấy đoạn đủ dài + vị trí char
+                segments = [(seg[0].strip(), seg[1], seg[2]) for seg in expanded if len(seg[0].split()) >= 6]
+                if not segments:
+                    continue
 
-            # Đếm tổng số ký tự chữ/số (loại bỏ ký tự đặc biệt) trong các đoạn trùng
-            total_matched_chars = 0
-            for s, e in merged_intervals:
-                segment = query_text[s:e]
-                # Loại bỏ ký tự không phải chữ/số
-                # clean_segment = re.sub(r"[^\w]", " ", segment)
-                tokens = segment.split()
-                total_matched_chars += len(tokens)
+                matched_tokens = sum(len(text.split()) for text, _, _ in segments)
+                total_matched_tokens += matched_tokens
 
-            # Tính độ dài "sạch" của toàn văn bản query (chỉ chữ/số)
-            # clean_query_text = re.sub(r"[^\w]", " ", query_text)
-            all_text_query = query_text.split()
-            clean_text_length = len(all_text_query)
+                similarity_percent = matched_tokens / query_tokens * 100
+                if similarity_percent < min_similarity * 100:
+                    continue
 
-            overall_similarity = (total_matched_chars / clean_text_length) * 100 if clean_text_length > 0 else 0
+                # Tìm bbox chính xác từ char index
+                box_sentences = self.get_bbox_from_char_range(query_path, segments)
 
-            logging.info(
-                f"Tổng số ký tự trùng: {total_matched_chars}/{(clean_text_length)} ({overall_similarity:.2f}%)"
-            )
+                similarity_documents.append({
+                    "name": doc.filename,
+                    "similarity_value": int(round(similarity_percent)),
+                    "similarity_box_sentences": box_sentences or []  # luôn có list
+                })
+
+            total_percent = round(total_matched_tokens / query_tokens * 100, 2) if query_tokens > 0 else 0.0
 
             return {
-                "overall_similarity": round(overall_similarity, 2),
-                "total_matched_chars": total_matched_chars,
-                "text_length": len(query_text),
-                "matches": merged_matches,
+                "data": {
+                    "total_percent": total_percent,
+                    "size_page": {"width": page_width, "height": page_height},
+                    "similarity_documents": sorted(
+                        similarity_documents,
+                        key=lambda x: x["similarity_value"],
+                        reverse=True
+                    )
+                }
             }
 
+        except Exception as e:
+            logging.exception("Lỗi trong detect_plagiarism_overall")
+            return {"error": str(e)}
         finally:
             session.close()
-
 
     def extract_text_from_pdf(self, pdf_path: str) -> str:
         try:
