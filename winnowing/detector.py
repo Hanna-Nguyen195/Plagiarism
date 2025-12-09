@@ -90,59 +90,46 @@ class WinnowingPlagiarismDetector:
         return merged
 
     def get_bbox_from_char_range(self, pdf_path: str, segments: List[Tuple[str, int, int]]) -> List[dict]:
-        """
-        Dùng char index (start, end) để lấy bbox chính xác từ page.chars
-        → Đây là cách CHUẨN NHẤT, KHÔNG BAO GIỜ MISS
-        """
         results = []
 
         with pdfplumber.open(pdf_path) as pdf:
-            # Tạo offset cho từng trang
             page_offsets = []
             offset = 0
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 page_offsets.append((i + 1, page, offset, offset + len(text)))
                 offset += len(text) + 1
-
             for text, start_char, end_char in segments:
                 if end_char <= start_char or len(text) < 30:
                     continue
-
                 for page_num, page, p_start, p_end in page_offsets:
                     if start_char >= p_end or end_char <= p_start:
                         continue
-
                     local_start = max(start_char - p_start, 0)
                     local_end = min(end_char - p_start, len(page.extract_text() or ""))
-
                     chars = page.chars
                     if not chars:
                         continue
-
                     matched = []
                     for ch in chars:
                         if "text" not in ch or not ch["text"]:
                             continue
-                        # Ước lượng vị trí ký tự
                         try:
                             pos = (page.extract_text() or "").find(ch["text"], local_start)
                             if pos != -1 and pos < local_end:
                                 matched.append(ch)
                         except:
                             continue
-
                     if not matched:
                         continue
-
                     xs = [ch["x0"] for ch in matched] + [ch["x1"] for ch in matched]
                     ys_top = [ch["top"] for ch in matched]
                     ys_bottom = [ch["bottom"] for ch in matched]
-
                     x0, x1 = min(xs), max(xs)
-                    y0 = page.height - max(ys_top)      # top-left
+                    y0 = page.height - max(ys_top)      
                     y1 = page.height - min(ys_bottom)
-
+                    text = text.split()
+                    text = " ".join(text) 
                     results.append({
                         "pageNumber": page_num,
                         "similarity_content": [{
@@ -153,10 +140,6 @@ class WinnowingPlagiarismDetector:
         return results
 
     def detect_plagiarism_overall(self, query_path: str, min_similarity: float = 0.05) -> Dict:
-        """
-        Hàm chính - trả về JSON đúng chuẩn frontend
-        min_similarity=0.05 → hiện tài liệu từ 5% trở lên
-        """
         session: SASession = SessionLocal()
         try:
             query_text = self.extract_text_from_pdf(query_path)
@@ -171,8 +154,6 @@ class WinnowingPlagiarismDetector:
 
             processed_query = self.winnowing.preprocess_text(query_text)
             fps_query = self.winnowing.generate_fingerprints(query_text)
-
-            # Tìm matches trong DB
             matches_by_pdf = defaultdict(list)
             for h, pos_q in fps_query:
                 results = session.query(Fingerprint.pdf_id, Fingerprint.position, PDFFile.filename, PDFFile.full_content)\
@@ -192,37 +173,32 @@ class WinnowingPlagiarismDetector:
             similarity_documents = []
             total_matched_tokens = 0
             query_tokens = len(query_text.split())
-
-            # Duyệt từng tài liệu nguồn
             for pdf_id, matches in matches_by_pdf.items():
                 doc = session.get(PDFFile, pdf_id)
                 if not doc:
                     continue
-
+                source_path = doc.file_path
                 processed_doc = self.winnowing.preprocess_text(doc.full_content)
                 expanded = self.merge_and_expand_matches(
                     query_text, doc.full_content, processed_query, processed_doc, matches
                 )
 
-                # Chỉ lấy đoạn đủ dài + vị trí char
                 segments = [(seg[0].strip(), seg[1], seg[2]) for seg in expanded if len(seg[0].split()) >= 6]
+                source_segments = [(doc.full_content[seg[3]:seg[4]].strip(), seg[3], seg[4]) for seg in expanded if len(seg[0].split()) >= 6] 
                 if not segments:
                     continue
-
                 matched_tokens = sum(len(text.split()) for text, _, _ in segments)
                 total_matched_tokens += matched_tokens
-
                 similarity_percent = matched_tokens / query_tokens * 100
                 if similarity_percent < min_similarity * 100:
                     continue
-
-                # Tìm bbox chính xác từ char index
                 box_sentences = self.get_bbox_from_char_range(query_path, segments)
-
+                source_box_sentences = self.get_bbox_from_char_range(source_path, source_segments)
                 similarity_documents.append({
                     "name": doc.filename,
                     "similarity_value": int(round(similarity_percent)),
-                    "similarity_box_sentences": box_sentences or []  # luôn có list
+                    "similarity_box_sentences": box_sentences or [],  
+                    "source_similarity_box_sentences": source_box_sentences or [], 
                 })
 
             total_percent = round(total_matched_tokens / query_tokens * 100, 2) if query_tokens > 0 else 0.0
@@ -251,12 +227,9 @@ class WinnowingPlagiarismDetector:
             texts = []
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages:
-                    page_text = page.extract_text(layout=True)
-                    if page_text:
-                        texts.append(page_text)
-            text = "\n".join(texts)
-            text = re.sub(r"\n+", "\n", text).strip()
-            text = re.sub(r" +", " ", text)
+                    page_text = page.extract_text(layout=True) or ""
+                    texts.append(page_text)
+            text = ''.join(texts).strip() 
             end_time = time.time()
             logging.info(f"Extracted text from {pdf_path} in {end_time - start_time:.2f}s ({len(text)} chars)")
             return text
